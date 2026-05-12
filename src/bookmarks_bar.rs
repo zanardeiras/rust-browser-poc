@@ -10,6 +10,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bookmarks::{Bookmark, BookmarkKind, BookmarksStore};
+use crate::settings::Settings;
+
+const SETTING_VISIBLE: &str = "bookmarks_bar_visible";
 
 pub struct BookmarksBar {
     /// Container final — adicione na sua janela.
@@ -17,6 +20,7 @@ pub struct BookmarksBar {
     /// Onde os botões dos favoritos vão; é re-populado a cada rebuild.
     inner_bar: gtk::Box,
     store: Rc<BookmarksStore>,
+    settings: Rc<Settings>,
     /// Callback chamada quando o usuário clica num link favorito.
     on_navigate: RefCell<Option<Rc<dyn Fn(&str)>>>,
     /// Callback chamada quando o usuário pede o gerenciador (engrenagem).
@@ -24,7 +28,7 @@ pub struct BookmarksBar {
 }
 
 impl BookmarksBar {
-    pub fn new(store: Rc<BookmarksStore>) -> Rc<Self> {
+    pub fn new(store: Rc<BookmarksStore>, settings: Rc<Settings>) -> Rc<Self> {
         // Wrapper: scroll horizontal de botões + engrenagem fixa à direita.
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         widget.style_context().add_class("bookmarks-bar");
@@ -41,13 +45,32 @@ impl BookmarksBar {
         scroller.set_min_content_height(28);
         scroller.add(&inner_bar);
 
-        let cog = gtk::Button::from_icon_name(
+        let cog = gtk::MenuButton::new();
+        cog.set_image(Some(&gtk::Image::from_icon_name(
             Some("emblem-system-symbolic"),
             gtk::IconSize::Menu,
-        );
+        )));
         cog.set_relief(gtk::ReliefStyle::None);
-        cog.set_tooltip_text(Some("Gerenciar favoritos"));
+        cog.set_tooltip_text(Some("Opções de favoritos"));
         cog.set_margin_end(6);
+
+        // Popover do cog: Gerenciar + Ocultar.
+        let popover = gtk::Popover::new(Some(&cog));
+        popover.set_position(gtk::PositionType::Bottom);
+        let pop_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        pop_box.set_margin_start(6);
+        pop_box.set_margin_end(6);
+        pop_box.set_margin_top(6);
+        pop_box.set_margin_bottom(6);
+
+        let btn_manage = button_row("emblem-system-symbolic", "Gerenciar favoritos…");
+        let btn_hide = button_row("view-restore-symbolic", "Ocultar barra de favoritos");
+        pop_box.pack_start(&btn_manage, false, false, 0);
+        pop_box.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 2);
+        pop_box.pack_start(&btn_hide, false, false, 0);
+        pop_box.show_all();
+        popover.add(&pop_box);
+        cog.set_popover(Some(&popover));
 
         widget.pack_start(&scroller, true, true, 0);
         widget.pack_end(&cog, false, false, 0);
@@ -80,14 +103,28 @@ impl BookmarksBar {
             widget,
             inner_bar,
             store: store.clone(),
+            settings: settings.clone(),
             on_navigate: RefCell::new(None),
             on_manage: RefCell::new(None),
         });
 
-        // Cog → manager.
-        let me_cog = me.clone();
-        cog.connect_clicked(move |_| {
-            if let Some(f) = me_cog.on_manage.borrow().as_ref() { f(); }
+        // Aplica visibilidade persistida ANTES de mostrar o widget pai.
+        me.apply_visibility();
+
+        // Manage → callback externa.
+        let me_mng = me.clone();
+        let popover_mng = popover.clone();
+        btn_manage.connect_clicked(move |_| {
+            popover_mng.popdown();
+            if let Some(f) = me_mng.on_manage.borrow().as_ref() { f(); }
+        });
+
+        // Hide → desliga visibilidade, persiste.
+        let me_hide = me.clone();
+        let popover_hide = popover.clone();
+        btn_hide.connect_clicked(move |_| {
+            popover_hide.popdown();
+            me_hide.set_visible_persisted(false);
         });
 
         // Listener: rebuild a cada mudança.
@@ -104,6 +141,28 @@ impl BookmarksBar {
 
     pub fn set_on_manage(&self, f: impl Fn() + 'static) {
         *self.on_manage.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Visibilidade atual lida das configurações (default: visível).
+    pub fn is_visible_persisted(&self) -> bool {
+        self.settings.get_bool(SETTING_VISIBLE, true)
+    }
+
+    /// Define visibilidade e persiste.
+    pub fn set_visible_persisted(&self, visible: bool) {
+        self.settings.set_bool(SETTING_VISIBLE, visible);
+        self.apply_visibility();
+    }
+
+    /// Aplica o estado atual ao widget.
+    fn apply_visibility(&self) {
+        let v = self.is_visible_persisted();
+        self.widget.set_visible(v);
+        self.widget.set_no_show_all(!v);
+    }
+
+    pub fn toggle_visible_persisted(&self) {
+        self.set_visible_persisted(!self.is_visible_persisted());
     }
 
     fn rebuild(&self) {
@@ -185,4 +244,18 @@ fn truncate_title(s: &str) -> String {
     if chars.len() <= MAX { s.to_string() } else {
         format!("{}…", chars[..MAX - 1].iter().collect::<String>())
     }
+}
+
+/// Cria um botão "linha de menu": ícone + label, alinhado à esquerda, sem relief.
+fn button_row(icon: &str, label: &str) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.set_relief(gtk::ReliefStyle::None);
+    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let img = gtk::Image::from_icon_name(Some(icon), gtk::IconSize::Menu);
+    let lbl = gtk::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    hbox.pack_start(&img, false, false, 0);
+    hbox.pack_start(&lbl, true, true, 0);
+    btn.add(&hbox);
+    btn
 }

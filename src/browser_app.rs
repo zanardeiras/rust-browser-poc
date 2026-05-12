@@ -16,6 +16,7 @@ use crate::history::HistoryManager;
 use crate::adblock::AdBlock;
 use crate::bookmarks::BookmarksStore;
 use crate::bookmarks_bar::BookmarksBar;
+use crate::settings::Settings;
 
 /// Cada aba possui (container_widget, webview).
 type TabEntry = (gtk::Widget, WebView);
@@ -80,7 +81,8 @@ impl BrowserApp {
 
         // Bookmarks store + bar (a bar entra abaixo da URL bar, acima do notebook).
         let bookmarks = BookmarksStore::new();
-        let bookmarks_bar = BookmarksBar::new(bookmarks.clone());
+        let settings = Settings::new();
+        let bookmarks_bar = BookmarksBar::new(bookmarks.clone(), settings.clone());
 
         // Container vertical: [bookmarks_bar] + [notebook].
         let main_vbox = Box::new(Orientation::Vertical, 0);
@@ -328,6 +330,7 @@ impl BrowserApp {
         let ab_hist = app_instance.adblock.clone();
         let h_hist = app_instance.history.clone();
         let update_star_hist = update_star.clone();
+        let bookmarks_bar_kb = bookmarks_bar.clone();
         app_instance.window.connect_key_press_event(move |_, ev| {
             let key = ev.keyval();
             let mods = ev.state();
@@ -346,6 +349,13 @@ impl BrowserApp {
                 if let Some(wv) = current_webview(&nb_hist, &wv_hist) {
                     wv.load_uri(&url);
                 }
+                return glib::Propagation::Stop;
+            }
+            // Ctrl+B — toggle da barra de favoritos.
+            if ctrl && (key == gtk::gdk::keys::constants::b
+                || key == gtk::gdk::keys::constants::B)
+            {
+                bookmarks_bar_kb.toggle_visible_persisted();
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -418,6 +428,37 @@ impl BrowserApp {
             }
         });
 
+        // Signal: Update favicon da aba. WebKit baixa o favicon automaticamente
+        // (porque setamos `set_favicon_database_directory`), e dispara
+        // `notify::favicon` quando a `cairo::Surface` está disponível.
+        // Convertimos a surface → Pixbuf escalado pra 16x16 e plotamos no Image
+        // que já está no tab_box. Sem favicon, mantém o ícone genérico.
+        let tab_icon_clone = tab_icon.clone();
+        webview.connect_favicon_notify(move |wv| {
+            if let Some(surface) = wv.favicon() {
+                // ImageSurface tem width/height; cast indireto via cairo::Surface.
+                // Usamos `pixbuf_get_from_surface` que aceita qualquer Surface.
+                let w = surface_size(&surface).0;
+                let h = surface_size(&surface).1;
+                if w == 0 || h == 0 { return; }
+                if let Some(pb) = gtk::gdk::pixbuf_get_from_surface(&surface, 0, 0, w, h) {
+                    // Escala pra 16x16 (tamanho padrão de favicon em aba).
+                    if let Some(scaled) = pb.scale_simple(
+                        16, 16, gtk::gdk_pixbuf::InterpType::Bilinear,
+                    ) {
+                        tab_icon_clone.set_from_pixbuf(Some(&scaled));
+                    } else {
+                        tab_icon_clone.set_from_pixbuf(Some(&pb));
+                    }
+                }
+            } else {
+                // Reseta para genérico quando não há favicon (ex.: chrome://).
+                tab_icon_clone.set_from_icon_name(
+                    Some("browser-symbolic"), gtk::IconSize::Menu,
+                );
+            }
+        });
+
         // Signal: Update URL bar when loading finishes
         let url_entry_load = url_entry.clone();
         let update_star_load = update_star.clone();
@@ -481,4 +522,15 @@ fn normalize_url(input: &str) -> String {
     } else {
         format!("https://www.google.com/search?q={}", input.replace(" ", "+"))
     }
+}
+
+/// Lê width/height de uma `cairo::Surface` (preferencialmente ImageSurface).
+/// Necessário porque `pixbuf_get_from_surface` exige dimensões explícitas.
+fn surface_size(surface: &gtk::cairo::Surface) -> (i32, i32) {
+    // Tenta cast para ImageSurface (caminho rápido — todo favicon WebKit é raster).
+    if let Ok(img) = surface.clone().try_into() as Result<gtk::cairo::ImageSurface, _> {
+        return (img.width(), img.height());
+    }
+    // Fallback: usa o device_scale + extents do contexto (defensivo).
+    (16, 16)
 }
