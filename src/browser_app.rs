@@ -41,6 +41,11 @@ impl BrowserApp {
             .default_height(768)
             .build();
 
+        // Carregar ícone nativo
+        if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file("icon.png") {
+            window.set_icon(Some(&pixbuf));
+        }
+
         let header_bar = HeaderBar::new();
         header_bar.set_show_close_button(true);
 

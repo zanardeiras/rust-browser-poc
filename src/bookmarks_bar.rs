@@ -157,8 +157,16 @@ impl BookmarksBar {
     /// Aplica o estado atual ao widget.
     fn apply_visibility(&self) {
         let v = self.is_visible_persisted();
-        self.widget.set_visible(v);
+        // `no_show_all=true` impede que `show_all()` da janela force o widget
+        // visível quando o usuário escolheu ocultar. Quando ele pede pra
+        // mostrar de novo, removemos a flag E chamamos show_all() explícito
+        // (caso contrário os filhos da barra ficam invisíveis).
         self.widget.set_no_show_all(!v);
+        if v {
+            self.widget.show_all();
+        } else {
+            self.widget.hide();
+        }
     }
 
     pub fn toggle_visible_persisted(&self) {
