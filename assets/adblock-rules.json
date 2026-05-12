@@ -1,0 +1,43 @@
+[
+  { "trigger": { "url-filter": ".*", "if-domain": ["doubleclick.net","googlesyndication.com","googleadservices.com","googletagservices.com","googletagmanager.com","google-analytics.com","adservice.google.com","adservice.google.com.br","adsystem.com","ads.yahoo.com","amazon-adsystem.com","adnxs.com","scorecardresearch.com","adsrvr.org","taboola.com","outbrain.com","criteo.com","criteo.net","rubiconproject.com","openx.net","pubmatic.com","yieldmo.com","quantserve.com","quantcount.com","rfihub.com","mathtag.com","pippio.com","bidswitch.net","bluekai.com","krxd.net","exelator.com","liadm.com","mediavoice.com","yldbt.com","zedo.com","2mdn.net","adform.net","adsafeprotected.com","moatads.com","serving-sys.com","adroll.com","facebook.net","connect.facebook.net","ads.linkedin.com","ads.pinterest.com","ads.twitter.com","static.ads-twitter.com","ads-api.twitter.com","analytics.tiktok.com","ads.tiktok.com","business-api.tiktok.com","hotjar.com","fullstory.com","mouseflow.com","clarity.ms","segment.io","amplitude.com","mixpanel.com","optimizely.com","crazyegg.com","chartbeat.com","newrelic.com","nr-data.net"] }, "action": { "type": "block" } },
+
+  { "trigger": { "url-filter": "/ads/" },              "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/ads\\." },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/ads_" },              "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/ads-" },              "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/ad/" },               "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adv/" },              "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/advert/" },           "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adverts/" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/advertising/" },      "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adservice" },         "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adsystem" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adtech" },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/banner/" },           "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/banners/" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/popup" },             "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/popunder" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/sponsor/" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/sponsored/" },        "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/tracking/" },         "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/tracker" },           "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/telemetry" },         "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/beacon" },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/pixel" },             "action": { "type": "block" } },
+
+  { "trigger": { "url-filter": "/googleads" },         "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/pagead" },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adsbygoogle" },       "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/pubads" },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/adsense" },           "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/gampad" },            "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/gpt\\.js" },          "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/gtag/js" },           "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/analytics\\.js" },    "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/fbevents\\.js" },     "action": { "type": "block" } },
+  { "trigger": { "url-filter": "/ga\\.js" },           "action": { "type": "block" } },
+
+  { "trigger": { "url-filter": ".*", "if-domain": ["sentry.io","sentry-cdn.com"], "resource-type": ["script","raw"] }, "action": { "type": "block" } },
+
+  { "trigger": { "url-filter": ".*" }, "action": { "type": "css-display-none", "selector": ".ad, .ads, .advert, .advertisement, .ad-banner, .ad-container, .ad-wrapper, .ad-slot, .ad-block, .adsbox, .adsbygoogle, .adsense, .google-ad, .gpt-ad, [id^='google_ads_'], [id^='div-gpt-ad'], [class*='advertisement'], [class*='-ads-'], [class*='_ads_'], [id*='taboola'], [class*='taboola'], [id*='outbrain'], [class*='outbrain'], [data-ad-slot], [aria-label='Advertisement'], [aria-label='advertisement']" } }
+]
