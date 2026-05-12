@@ -31,7 +31,7 @@ fn main() {
     }
 
     let app = Application::builder()
-        .application_id("org.example.rust_browser_poc")
+        .application_id("com.rust.browser.poc")
         .build();
 
     // Mantemos uma referência forte para o BrowserApp para ele não ser dropado

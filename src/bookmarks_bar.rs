@@ -22,9 +22,21 @@ pub struct BookmarksBar {
     store: Rc<BookmarksStore>,
     settings: Rc<Settings>,
     /// Callback chamada quando o usuário clica num link favorito.
-    on_navigate: RefCell<Option<Rc<dyn Fn(&str)>>>,
+    ///
+    /// IMPORTANTE: o `Rc` é OBRIGATÓRIO em volta do `RefCell`. Sem ele,
+    /// `RefCell<T: Clone>` implementa `Clone` por SNAPSHOT — ou seja, cada
+    /// `self.on_navigate.clone()` em `build_widget` produziria um RefCell
+    /// independente contendo o valor `Option<...>` daquele instante.
+    /// Como `rebuild()` é chamado em `new()` ANTES de `set_on_navigate()`,
+    /// os botões guardariam um snapshot `None` para sempre, e qualquer
+    /// atribuição posterior ao callback seria invisível pra eles.
+    /// Com `Rc<RefCell<...>>`, `.clone()` apenas incrementa o refcount do
+    /// `Rc` — todos os botões compartilham a MESMA célula viva e leem o
+    /// callback atual no momento do clique.
+    on_navigate: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
     /// Callback chamada quando o usuário pede o gerenciador (engrenagem).
-    on_manage: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Mesmo motivo do `on_navigate` para usar `Rc<RefCell<...>>`.
+    on_manage: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl BookmarksBar {
@@ -104,8 +116,8 @@ impl BookmarksBar {
             inner_bar,
             store: store.clone(),
             settings: settings.clone(),
-            on_navigate: RefCell::new(None),
-            on_manage: RefCell::new(None),
+            on_navigate: Rc::new(RefCell::new(None)),
+            on_manage: Rc::new(RefCell::new(None)),
         });
 
         // Aplica visibilidade persistida ANTES de mostrar o widget pai.

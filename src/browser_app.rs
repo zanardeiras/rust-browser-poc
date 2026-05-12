@@ -145,15 +145,73 @@ impl BrowserApp {
         // Initialize AdBlock
         let adblock = AdBlock::new(&base_dir);
 
-        // Autocomplete
+        // === Autocomplete inteligente (substring + inline ghost text) ===
+        //
+        // Decisões de design:
+        //  - Guardamos no ListStore a URL "display" SEM esquema/`www.` (ex.:
+        //    "youtube.com/watch?v=..." em vez de "https://www.youtube.com/..").
+        //    Isso permite que o inline-completion nativo do GTK (que casa por
+        //    prefixo) funcione: digitar "you" preenche "youtube.com" inline.
+        //  - Um `match_func` customizado faz matching por SUBSTRING case-
+        //    insensitive na display string — então digitar "tube" também faz
+        //    aparecer "youtube.com" no popup, igual Chrome/Firefox fazem.
+        //  - O store é semeado com domínios populares para que o autocomplete
+        //    funcione já no primeiro uso (antes de existir histórico).
         let completion = EntryCompletion::new();
         let store = ListStore::new(&[glib::Type::STRING]);
-        for item in history.load() {
-            let iter = store.append();
-            store.set_value(&iter, 0, &item.to_value());
+
+        // Dedup helper local: insere uma display string se ainda não existir.
+        let insert_unique = |s: &str| {
+            // Varre store linearmente; ok para tamanhos típicos de histórico.
+            if let Some(iter) = store.iter_first() {
+                loop {
+                    let v = store.value(&iter, 0).get::<String>().unwrap_or_default();
+                    if v == s { return; }
+                    if !store.iter_next(&iter) { break; }
+                }
+            }
+            let it = store.append();
+            store.set_value(&it, 0, &s.to_value());
+        };
+
+        // Seeds: domínios populares para autocomplete imediato.
+        for seed in [
+            "youtube.com", "google.com", "github.com", "gmail.com",
+            "stackoverflow.com", "reddit.com", "wikipedia.org", "twitter.com",
+            "x.com", "facebook.com", "instagram.com", "linkedin.com",
+            "amazon.com", "amazon.com.br", "netflix.com", "twitch.tv",
+            "chatgpt.com", "claude.ai", "duckduckgo.com",
+        ] {
+            insert_unique(seed);
         }
+
+        // Histórico: insere versão "limpa" de cada URL.
+        for item in history.load() {
+            insert_unique(&strip_url_for_display(&item));
+        }
+
         completion.set_model(Some(&store));
         completion.set_text_column(0);
+        completion.set_minimum_key_length(1);
+        completion.set_popup_completion(true);
+        completion.set_inline_completion(true);
+        completion.set_inline_selection(false);
+        completion.set_popup_single_match(true);
+
+        // Matching por substring (case-insensitive), igual barra de endereço
+        // de navegadores modernos. Retorna true se o que o usuário digitou
+        // aparece em qualquer posição da display string.
+        completion.set_match_func(|_c, key, iter| {
+            // O modelo do completion é o ListStore que setamos acima.
+            let model = match _c.model() { Some(m) => m, None => return false };
+            let val: String = model
+                .value(iter, 0)
+                .get::<String>()
+                .unwrap_or_default();
+            if key.is_empty() { return false; }
+            val.to_ascii_lowercase().contains(&key.to_ascii_lowercase())
+        });
+
         url_entry.set_completion(Some(&completion));
 
         let app_instance = Self {
@@ -274,13 +332,15 @@ impl BrowserApp {
             let input = entry.text().to_string();
             let url = normalize_url(&input);
             history_nav.add(&url);
-            
-            // Update history store
+
+            // Atualiza store do autocomplete usando a versão "display"
+            // (sem https://www.) para casar com o esquema de inline-completion.
+            let display = strip_url_for_display(&url);
             let mut found = false;
             if let Some(iter) = store_nav.iter_first() {
                 loop {
                     let value = store_nav.value(&iter, 0).get::<String>().unwrap_or_default();
-                    if value == url {
+                    if value == display {
                         found = true;
                         break;
                     }
@@ -289,7 +349,7 @@ impl BrowserApp {
             }
             if !found {
                 let iter = store_nav.append();
-                store_nav.set_value(&iter, 0, &url.to_value());
+                store_nav.set_value(&iter, 0, &display.to_value());
             }
 
             if let Some(wv) = current_webview(&notebook_nav, &webviews_nav) {
@@ -534,6 +594,21 @@ fn normalize_url(input: &str) -> String {
     } else {
         format!("https://www.google.com/search?q={}", input.replace(" ", "+"))
     }
+}
+
+/// Remove esquema (`http://`, `https://`) e prefixo `www.` para gerar a
+/// "display string" usada no autocomplete. Mantém path/query/fragment.
+/// Ex.: `https://www.youtube.com/watch?v=ID` → `youtube.com/watch?v=ID`.
+/// URLs não-http (data:, about:, webkit://) são retornadas inalteradas.
+fn strip_url_for_display(url: &str) -> String {
+    let s = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else {
+        return url.to_string();
+    };
+    s.strip_prefix("www.").unwrap_or(s).to_string()
 }
 
 /// Lê width/height de uma `cairo::Surface` (preferencialmente ImageSurface).
