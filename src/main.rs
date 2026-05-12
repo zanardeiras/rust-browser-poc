@@ -9,6 +9,9 @@ mod history_page;
 mod adblock;
 mod easylist;
 mod userscripts;
+mod bookmarks;
+mod bookmarks_bar;
+mod bookmarks_manager;
 use browser_app::BrowserApp;
 
 fn main() {

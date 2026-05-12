@@ -1,7 +1,7 @@
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, HeaderBar, Entry, Notebook, Button, Label,
-    Box, Orientation, EntryCompletion, ListStore, Image,
+    Application, ApplicationWindow, HeaderBar, Entry, EntryIconPosition,
+    Notebook, Button, Label, Box, Orientation, EntryCompletion, ListStore, Image,
 };
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -14,6 +14,8 @@ use webkit2gtk::{
 };
 use crate::history::HistoryManager;
 use crate::adblock::AdBlock;
+use crate::bookmarks::BookmarksStore;
+use crate::bookmarks_bar::BookmarksBar;
 
 /// Cada aba possui (container_widget, webview).
 type TabEntry = (gtk::Widget, WebView);
@@ -26,6 +28,7 @@ pub struct BrowserApp {
     pub web_context: WebContext,
     pub history: HistoryManager,
     pub adblock: Rc<AdBlock>,
+    pub bookmarks: Rc<BookmarksStore>,
 }
 
 impl BrowserApp {
@@ -64,7 +67,16 @@ impl BrowserApp {
         let notebook = Notebook::new();
         notebook.set_scrollable(true);
         notebook.set_show_tabs(true);
-        window.add(&notebook);
+
+        // Bookmarks store + bar (a bar entra abaixo da URL bar, acima do notebook).
+        let bookmarks = BookmarksStore::new();
+        let bookmarks_bar = BookmarksBar::new(bookmarks.clone());
+
+        // Container vertical: [bookmarks_bar] + [notebook].
+        let main_vbox = Box::new(Orientation::Vertical, 0);
+        main_vbox.pack_start(&bookmarks_bar.widget, false, false, 0);
+        main_vbox.pack_start(&notebook, true, true, 0);
+        window.add(&main_vbox);
 
         let webviews = Rc::new(RefCell::new(Vec::new()));
         let history = HistoryManager::new();
@@ -135,7 +147,54 @@ impl BrowserApp {
             web_context,
             history,
             adblock,
+            bookmarks: bookmarks.clone(),
         };
+
+        // === Estrelinha (favoritar página atual) na URL bar ===
+        // Renderiza ícone secundário na entry: vazio → "non-starred-symbolic",
+        // favoritado → "starred-symbolic" (dourado nos temas adwaita/breeze).
+        // Click no ícone → toggle do bookmark.
+        app_instance.url_entry.set_icon_from_icon_name(
+            EntryIconPosition::Secondary,
+            Some("non-starred-symbolic"),
+        );
+        app_instance.url_entry.set_icon_tooltip_text(
+            EntryIconPosition::Secondary,
+            Some("Favoritar página"),
+        );
+        app_instance.url_entry.set_icon_activatable(EntryIconPosition::Secondary, true);
+
+        let notebook_star = app_instance.notebook.clone();
+        let webviews_star = app_instance.webviews.clone();
+        let bookmarks_star = bookmarks.clone();
+        app_instance.url_entry.connect_icon_release(move |entry, pos, _ev| {
+            if pos != EntryIconPosition::Secondary { return; }
+            if let Some(wv) = current_webview(&notebook_star, &webviews_star) {
+                let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                if url.is_empty() || url.starts_with("data:") { return; }
+                let title = wv.title().map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| url.clone());
+                let is_now = bookmarks_star.toggle_url(&url, &title);
+                let icon = if is_now { "starred-symbolic" } else { "non-starred-symbolic" };
+                entry.set_icon_from_icon_name(EntryIconPosition::Secondary, Some(icon));
+            }
+        });
+
+        // === Wire bookmarks_bar callbacks ===
+        let notebook_bm = app_instance.notebook.clone();
+        let webviews_bm = app_instance.webviews.clone();
+        bookmarks_bar.set_on_navigate(move |url| {
+            if let Some(wv) = current_webview(&notebook_bm, &webviews_bm) {
+                wv.load_uri(url);
+            }
+        });
+
+        let bookmarks_for_mgr = bookmarks.clone();
+        let window_for_mgr = app_instance.window.clone();
+        bookmarks_bar.set_on_manage(move || {
+            crate::bookmarks_manager::open_manager(&bookmarks_for_mgr, Some(&window_for_mgr.clone().upcast::<gtk::Window>()));
+        });
 
         // Navigation Actions
         let notebook_nav_back = app_instance.notebook.clone();
@@ -218,12 +277,42 @@ impl BrowserApp {
         // Tab switch logic
         let url_entry_switch = app_instance.url_entry.clone();
         let webviews_switch = app_instance.webviews.clone();
+        let bookmarks_switch = app_instance.bookmarks.clone();
         app_instance.notebook.connect_switch_page(move |_, page, _| {
             let list = webviews_switch.borrow();
             if let Some((_, wv)) = list.iter().find(|(w, _)| w == page) {
                 if let Some(u) = wv.uri() {
-                    url_entry_switch.set_text(u.as_str());
+                    let u = u.as_str().to_string();
+                    url_entry_switch.set_text(&u);
+                    let icon = if bookmarks_switch.is_bookmarked(&u) {
+                        "starred-symbolic"
+                    } else {
+                        "non-starred-symbolic"
+                    };
+                    url_entry_switch.set_icon_from_icon_name(
+                        EntryIconPosition::Secondary, Some(icon),
+                    );
                 }
+            }
+        });
+
+        // === Atualiza estrelinha quando a URL da aba ativa muda ===
+        let url_entry_star_uri = app_instance.url_entry.clone();
+        let nb_star_uri = app_instance.notebook.clone();
+        let webviews_star_uri = app_instance.webviews.clone();
+        let bookmarks_star_uri = app_instance.bookmarks.clone();
+        app_instance.bookmarks.on_change(move || {
+            // Quando bookmarks mudam (toggle, manager), reflete na estrela.
+            if let Some(wv) = current_webview(&nb_star_uri, &webviews_star_uri) {
+                let u = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                let icon = if bookmarks_star_uri.is_bookmarked(&u) {
+                    "starred-symbolic"
+                } else {
+                    "non-starred-symbolic"
+                };
+                url_entry_star_uri.set_icon_from_icon_name(
+                    EntryIconPosition::Secondary, Some(icon),
+                );
             }
         });
 
