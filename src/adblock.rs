@@ -8,6 +8,10 @@
 //! 3. **Recompilação dinâmica** — quando o background termina, fazemos um novo
 //!    `save_async` e o filter resultante substitui o anterior em todos os tabs.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::path::PathBuf;

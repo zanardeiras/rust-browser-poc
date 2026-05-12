@@ -28,6 +28,10 @@
 //!   4. Notifica main thread via `glib::MainContext::channel`.
 //!   5. Main thread chama `AdBlock::recompile_from_disk`.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 

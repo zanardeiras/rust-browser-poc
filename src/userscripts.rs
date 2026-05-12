@@ -13,6 +13,10 @@
 //! O script roda em `DocumentStart` em todos os subframes do youtube.com
 //! para também cobrir embeds.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use webkit2gtk::{
     UserContentManager, UserContentManagerExt, UserScript, UserStyleSheet,
     UserContentInjectedFrames, UserScriptInjectionTime, UserStyleLevel,
