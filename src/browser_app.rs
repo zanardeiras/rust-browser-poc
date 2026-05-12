@@ -1,6 +1,6 @@
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, HeaderBar, Entry, EntryIconPosition,
+    Application, ApplicationWindow, HeaderBar, Entry,
     Notebook, Button, Label, Box, Orientation, EntryCompletion, ListStore, Image,
 };
 use std::rc::Rc;
@@ -61,6 +61,16 @@ impl BrowserApp {
         // New Tab Button
         let new_tab_button = Button::from_icon_name(Some("list-add-symbolic"), gtk::IconSize::Button);
         header_bar.pack_end(&new_tab_button);
+
+        // Star Button (favoritar página atual) — fica ao lado de new_tab,
+        // FORA da URL bar. Dourado quando favoritado.
+        let star_button = Button::from_icon_name(
+            Some("non-starred-symbolic"),
+            gtk::IconSize::Button,
+        );
+        star_button.set_tooltip_text(Some("Favoritar página"));
+        star_button.set_relief(gtk::ReliefStyle::None);
+        header_bar.pack_end(&star_button);
 
         window.set_titlebar(Some(&header_bar));
 
@@ -150,25 +160,12 @@ impl BrowserApp {
             bookmarks: bookmarks.clone(),
         };
 
-        // === Estrelinha (favoritar página atual) na URL bar ===
-        // Renderiza ícone secundário na entry: vazio → "non-starred-symbolic",
-        // favoritado → "starred-symbolic" (dourado nos temas adwaita/breeze).
-        // Click no ícone → toggle do bookmark.
-        app_instance.url_entry.set_icon_from_icon_name(
-            EntryIconPosition::Secondary,
-            Some("non-starred-symbolic"),
-        );
-        app_instance.url_entry.set_icon_tooltip_text(
-            EntryIconPosition::Secondary,
-            Some("Favoritar página"),
-        );
-        app_instance.url_entry.set_icon_activatable(EntryIconPosition::Secondary, true);
-
+        // === Estrelinha externa: click toggla bookmark da página ativa ===
         let notebook_star = app_instance.notebook.clone();
         let webviews_star = app_instance.webviews.clone();
         let bookmarks_star = bookmarks.clone();
-        app_instance.url_entry.connect_icon_release(move |entry, pos, _ev| {
-            if pos != EntryIconPosition::Secondary { return; }
+        let star_button_click = star_button.clone();
+        star_button.connect_clicked(move |_| {
             if let Some(wv) = current_webview(&notebook_star, &webviews_star) {
                 let url = wv.uri().map(|s| s.to_string()).unwrap_or_default();
                 if url.is_empty() || url.starts_with("data:") { return; }
@@ -177,8 +174,25 @@ impl BrowserApp {
                     .unwrap_or_else(|| url.clone());
                 let is_now = bookmarks_star.toggle_url(&url, &title);
                 let icon = if is_now { "starred-symbolic" } else { "non-starred-symbolic" };
-                entry.set_icon_from_icon_name(EntryIconPosition::Secondary, Some(icon));
+                star_button_click.set_image(Some(&Image::from_icon_name(
+                    Some(icon), gtk::IconSize::Button,
+                )));
             }
+        });
+
+        // Closure compartilhada para atualizar visual da estrela conforme URL.
+        // Usada por: switch_page, on_change do store, e uri_notify de cada webview.
+        let star_button_upd = star_button.clone();
+        let bookmarks_upd = bookmarks.clone();
+        let update_star: Rc<dyn Fn(&str)> = Rc::new(move |url: &str| {
+            let icon = if bookmarks_upd.is_bookmarked(url) {
+                "starred-symbolic"
+            } else {
+                "non-starred-symbolic"
+            };
+            star_button_upd.set_image(Some(&Image::from_icon_name(
+                Some(icon), gtk::IconSize::Button,
+            )));
         });
 
         // === Wire bookmarks_bar callbacks ===
@@ -228,8 +242,9 @@ impl BrowserApp {
         let wc_clone = app_instance.web_context.clone();
         let adblock_clone = app_instance.adblock.clone();
         let history_for_new_tab = app_instance.history.clone();
+        let update_star_newtab = update_star.clone();
         new_tab_button.connect_clicked(move |_| {
-            Self::add_tab(&notebook_clone, webviews_clone.clone(), url_entry_clone.clone(), &wc_clone, &adblock_clone, history_for_new_tab.clone());
+            Self::add_tab(&notebook_clone, webviews_clone.clone(), url_entry_clone.clone(), &wc_clone, &adblock_clone, history_for_new_tab.clone(), update_star_newtab.clone());
         });
 
         // Initial tab
@@ -240,6 +255,7 @@ impl BrowserApp {
             &app_instance.web_context,
             &app_instance.adblock,
             app_instance.history.clone(),
+            update_star.clone(),
         );
 
         // URL Entry Logic
@@ -277,42 +293,24 @@ impl BrowserApp {
         // Tab switch logic
         let url_entry_switch = app_instance.url_entry.clone();
         let webviews_switch = app_instance.webviews.clone();
-        let bookmarks_switch = app_instance.bookmarks.clone();
+        let update_star_switch = update_star.clone();
         app_instance.notebook.connect_switch_page(move |_, page, _| {
             let list = webviews_switch.borrow();
             if let Some((_, wv)) = list.iter().find(|(w, _)| w == page) {
-                if let Some(u) = wv.uri() {
-                    let u = u.as_str().to_string();
-                    url_entry_switch.set_text(&u);
-                    let icon = if bookmarks_switch.is_bookmarked(&u) {
-                        "starred-symbolic"
-                    } else {
-                        "non-starred-symbolic"
-                    };
-                    url_entry_switch.set_icon_from_icon_name(
-                        EntryIconPosition::Secondary, Some(icon),
-                    );
-                }
+                let u = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                url_entry_switch.set_text(&u);
+                update_star_switch(&u);
             }
         });
 
-        // === Atualiza estrelinha quando a URL da aba ativa muda ===
-        let url_entry_star_uri = app_instance.url_entry.clone();
+        // === Atualiza estrelinha quando store muda (toggle, manager). ===
         let nb_star_uri = app_instance.notebook.clone();
         let webviews_star_uri = app_instance.webviews.clone();
-        let bookmarks_star_uri = app_instance.bookmarks.clone();
+        let update_star_change = update_star.clone();
         app_instance.bookmarks.on_change(move || {
-            // Quando bookmarks mudam (toggle, manager), reflete na estrela.
             if let Some(wv) = current_webview(&nb_star_uri, &webviews_star_uri) {
                 let u = wv.uri().map(|s| s.to_string()).unwrap_or_default();
-                let icon = if bookmarks_star_uri.is_bookmarked(&u) {
-                    "starred-symbolic"
-                } else {
-                    "non-starred-symbolic"
-                };
-                url_entry_star_uri.set_icon_from_icon_name(
-                    EntryIconPosition::Secondary, Some(icon),
-                );
+                update_star_change(&u);
             }
         });
 
@@ -329,6 +327,7 @@ impl BrowserApp {
         let wc_hist = app_instance.web_context.clone();
         let ab_hist = app_instance.adblock.clone();
         let h_hist = app_instance.history.clone();
+        let update_star_hist = update_star.clone();
         app_instance.window.connect_key_press_event(move |_, ev| {
             let key = ev.keyval();
             let mods = ev.state();
@@ -341,6 +340,7 @@ impl BrowserApp {
                 Self::add_tab(
                     &nb_hist, wv_hist.clone(), url_hist.clone(),
                     &wc_hist, &ab_hist, h_hist.clone(),
+                    update_star_hist.clone(),
                 );
                 // Carrega a página interna na aba recém-criada.
                 if let Some(wv) = current_webview(&nb_hist, &wv_hist) {
@@ -361,6 +361,7 @@ impl BrowserApp {
         web_context: &WebContext,
         adblock: &Rc<AdBlock>,
         history: HistoryManager,
+        update_star: Rc<dyn Fn(&str)>,
     ) {
         let container = Box::new(Orientation::Vertical, 0);
         container.show();
@@ -419,9 +420,13 @@ impl BrowserApp {
 
         // Signal: Update URL bar when loading finishes
         let url_entry_load = url_entry.clone();
+        let update_star_load = update_star.clone();
         webview.connect_uri_notify(move |wv| {
             if let Some(u) = wv.uri() {
-                url_entry_load.set_text(u.as_str());
+                let s = u.as_str();
+                url_entry_load.set_text(s);
+                // Reseta visual da estrela conforme nova URL.
+                update_star_load(s);
             }
         });
 

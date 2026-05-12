@@ -18,11 +18,14 @@ const COL_KIND: u32 = 3; // "F" ou "L"
 pub fn open_manager(store: &Rc<BookmarksStore>, parent: Option<&gtk::Window>) {
     let dialog = gtk::Window::builder()
         .title("Gerenciar favoritos")
-        .default_width(720)
-        .default_height(520)
-        .modal(false)
+        .default_width(760)
+        .default_height(540)
+        .modal(true)
         .build();
-    if let Some(p) = parent { dialog.set_transient_for(Some(p)); }
+    if let Some(p) = parent {
+        dialog.set_transient_for(Some(p));
+        dialog.set_destroy_with_parent(true);
+    }
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
@@ -33,13 +36,14 @@ pub fn open_manager(store: &Rc<BookmarksStore>, parent: Option<&gtk::Window>) {
     toolbar.set_margin_top(8);
     toolbar.set_margin_bottom(8);
 
-    let btn_new_folder = gtk::Button::with_label("Nova pasta");
-    let btn_new_link = gtk::Button::with_label("Novo favorito");
-    let btn_edit = gtk::Button::with_label("Editar");
-    let btn_delete = gtk::Button::with_label("Excluir");
+    let btn_new_folder = button_with_icon("folder-new-symbolic", "Nova pasta");
+    let btn_new_link = button_with_icon("emblem-favorite-symbolic", "Novo favorito");
+    let btn_edit = button_with_icon("document-edit-symbolic", "Editar");
+    let btn_delete = button_with_icon("edit-delete-symbolic", "Excluir");
     let btn_up = gtk::Button::from_icon_name(Some("go-up-symbolic"), gtk::IconSize::Button);
     let btn_down = gtk::Button::from_icon_name(Some("go-down-symbolic"), gtk::IconSize::Button);
-    let btn_move = gtk::Button::with_label("Mover para…");
+    let btn_move = button_with_icon("folder-symbolic", "Mover para…");
+    btn_new_folder.style_context().add_class("suggested-action");
 
     toolbar.pack_start(&btn_new_folder, false, false, 0);
     toolbar.pack_start(&btn_new_link, false, false, 0);
@@ -204,6 +208,19 @@ pub fn open_manager(store: &Rc<BookmarksStore>, parent: Option<&gtk::Window>) {
     });
 
     dialog.show_all();
+    dialog.present();
+}
+
+/// Botão com ícone à esquerda + label à direita (visual claro de ação).
+fn button_with_icon(icon: &str, label: &str) -> gtk::Button {
+    let btn = gtk::Button::new();
+    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let img = gtk::Image::from_icon_name(Some(icon), gtk::IconSize::Button);
+    let lbl = gtk::Label::new(Some(label));
+    hbox.pack_start(&img, false, false, 0);
+    hbox.pack_start(&lbl, false, false, 0);
+    btn.add(&hbox);
+    btn
 }
 
 fn parent_for_new(store: &Rc<BookmarksStore>, selected: Option<u64>) -> u64 {
