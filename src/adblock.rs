@@ -1,9 +1,12 @@
 //! AdBlock nativo via WebKitUserContentFilterStore.
 //!
-//! O WebKit possui um motor de Content Blockers escrito em C++ (o mesmo usado
-//! pelo Safari). Aqui compilamos uma lista JSON em bytecode otimizado, salvamos
-//! em disco (cache de compilação) e injetamos um `UserContentFilter` em cada
-//! `UserContentManager` das abas. Toggle on/off é instantâneo em runtime.
+//! ## Camadas
+//!
+//! 1. **Bundled** — `assets/adblock-rules.json` (embarcado no binário).
+//! 2. **EasyList + EasyPrivacy** — baixados em background, parseados via
+//!    [`crate::easylist`], escritos em `~/.cache/.../easylist-cache/combined-rules.json`.
+//! 3. **Recompilação dinâmica** — quando o background termina, fazemos um novo
+//!    `save_async` e o filter resultante substitui o anterior em todos os tabs.
 
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -15,22 +18,23 @@ use glib::translate::ToGlibPtr;
 use webkit2gtk::UserContentManager;
 use webkit2gtk_sys as ffi;
 
-/// Lista de regras embarcada no binário (formato WebKit Content Blockers JSON).
-const RULES_JSON: &str = include_str!("../assets/adblock-rules.json");
-const FILTER_ID: &str = "rust-browser-poc-adblock-v1";
+use crate::easylist;
+
+const BUNDLED_RULES_JSON: &str = include_str!("../assets/adblock-rules.json");
+const FILTER_ID_BUNDLED: &str = "rust-browser-poc-adblock-bundled-v1";
+const FILTER_ID_FULL: &str = "rust-browser-poc-adblock-full-v1";
 
 pub struct AdBlock {
     store: *mut ffi::WebKitUserContentFilterStore,
-    /// Filtro compilado. None enquanto a compilação async não terminou.
     filter: RefCell<Option<*mut ffi::WebKitUserContentFilter>>,
-    /// Managers de cada aba viva — para aplicar/remover globalmente no toggle.
+    active_filter_id: RefCell<String>,
     managers: RefCell<Vec<UserContentManager>>,
     enabled: RefCell<bool>,
     state_file: PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl AdBlock {
-    /// Cria o store em `<base>/adblock-store/` e dispara compilação assíncrona.
     pub fn new(base_dir: &PathBuf) -> Rc<Self> {
         let store_dir = base_dir.join("adblock-store");
         let _ = std::fs::create_dir_all(&store_dir);
@@ -45,28 +49,70 @@ impl AdBlock {
         let me = Rc::new(Self {
             store,
             filter: RefCell::new(None),
+            active_filter_id: RefCell::new(String::new()),
             managers: RefCell::new(Vec::new()),
             enabled: RefCell::new(enabled),
             state_file,
+            cache_dir: base_dir.clone(),
         });
 
-        Self::compile_async(me.clone());
+        let combined_path = easylist::combined_rules_path(base_dir);
+        if easylist::cache_fresh(base_dir) {
+            if let Ok(json) = std::fs::read_to_string(&combined_path) {
+                eprintln!("[adblock] using cached combined ruleset ({} bytes)", json.len());
+                Self::compile_async(me.clone(), json, FILTER_ID_FULL);
+                return me;
+            }
+        }
+        // Fallback: bundled imediato + refresh em background.
+        Self::compile_async(me.clone(), BUNDLED_RULES_JSON.to_string(), FILTER_ID_BUNDLED);
+        Self::kick_off_background_refresh(me.clone());
         me
     }
 
-    fn compile_async(this: Rc<Self>) {
-        // GBytes referenciando a string estática (zero-copy: ponteiro para .rodata).
+    fn kick_off_background_refresh(this: Rc<Self>) {
+        // glib::MainContext::channel está marcado deprecated em favor de
+        // async-channel + spawn_future_local, mas a alternativa exige
+        // `Send` no receiver (i.e. trocar Rc<AdBlock> por Arc<AdBlock>,
+        // cascateando refactor em toda a app sem ganho funcional).
+        // O channel síncrono ainda é o caminho idiomático para "thread → main loop".
+        #[allow(deprecated)]
+        let (tx, rx) = glib::MainContext::channel::<bool>(glib::Priority::DEFAULT_IDLE);
+        let cache_dir = this.cache_dir.clone();
+        easylist::refresh_in_background(
+            cache_dir,
+            BUNDLED_RULES_JSON.to_string(),
+            tx,
+        );
+        let this_for_rx = this.clone();
+        rx.attach(None, move |ok| {
+            if ok {
+                let path = easylist::combined_rules_path(&this_for_rx.cache_dir);
+                match std::fs::read_to_string(&path) {
+                    Ok(json) => {
+                        eprintln!("[adblock] recompiling with full ruleset ({} bytes)...", json.len());
+                        Self::compile_async(this_for_rx.clone(), json, FILTER_ID_FULL);
+                    }
+                    Err(e) => eprintln!("[adblock] read combined json failed: {}", e),
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn compile_async(this: Rc<Self>, json: String, filter_id: &'static str) {
+        // g_bytes_new faz COPY do buffer — seguro com Strings runtime.
         let bytes = unsafe {
-            glib::ffi::g_bytes_new_static(
-                RULES_JSON.as_ptr() as *const _,
-                RULES_JSON.len(),
+            glib::ffi::g_bytes_new(
+                json.as_ptr() as *const _,
+                json.len(),
             )
         };
-        let id_c = CString::new(FILTER_ID).unwrap();
+        let id_c = CString::new(filter_id).unwrap();
         let store_ptr = this.store;
 
-        // Passa Rc<AdBlock> como user_data via Box raw pointer.
-        let user_data = Box::into_raw(Box::new(this)) as glib::ffi::gpointer;
+        let ctx = Box::new(CallbackCtx { this, filter_id });
+        let user_data = Box::into_raw(ctx) as glib::ffi::gpointer;
 
         unsafe {
             ffi::webkit_user_content_filter_store_save(
@@ -77,7 +123,6 @@ impl AdBlock {
                 Some(save_finished_trampoline),
                 user_data,
             );
-            // O store_save retém o GBytes; podemos liberar nosso ref aqui.
             glib::ffi::g_bytes_unref(bytes);
         }
     }
@@ -86,8 +131,6 @@ impl AdBlock {
         *self.enabled.borrow()
     }
 
-    /// Registra um `UserContentManager` de uma aba recém-criada.
-    /// Se o filter já estiver compilado e adblock ativo, aplica imediatamente.
     pub fn register_manager(&self, ucm: UserContentManager) {
         if *self.enabled.borrow() {
             if let Some(filter) = *self.filter.borrow() {
@@ -102,18 +145,18 @@ impl AdBlock {
         self.managers.borrow_mut().push(ucm);
     }
 
-    /// Liga/desliga o adblock em todos os managers registrados.
     pub fn set_enabled(&self, on: bool) {
         *self.enabled.borrow_mut() = on;
         let _ = std::fs::write(&self.state_file, if on { "1" } else { "0" });
         self.apply_to_all();
     }
 
-    /// Aplica o estado atual (filter + enabled) a todos os managers.
     fn apply_to_all(&self) {
         let on = *self.enabled.borrow();
         let filter_opt = *self.filter.borrow();
-        let id_c = CString::new(FILTER_ID).unwrap();
+        let id_str = self.active_filter_id.borrow().clone();
+        if id_str.is_empty() { return; }
+        let id_c = CString::new(id_str).unwrap();
         for ucm in self.managers.borrow().iter() {
             unsafe {
                 ffi::webkit_user_content_manager_remove_filter_by_id(
@@ -131,6 +174,27 @@ impl AdBlock {
             }
         }
     }
+
+    fn install_new_filter(&self, new_filter: *mut ffi::WebKitUserContentFilter, new_id: &str) {
+        let old_id = self.active_filter_id.borrow().clone();
+        if !old_id.is_empty() {
+            let id_c = CString::new(old_id).unwrap();
+            for ucm in self.managers.borrow().iter() {
+                unsafe {
+                    ffi::webkit_user_content_manager_remove_filter_by_id(
+                        ucm.to_glib_none().0,
+                        id_c.as_ptr(),
+                    );
+                }
+            }
+        }
+        if let Some(f) = self.filter.borrow_mut().take() {
+            unsafe { ffi::webkit_user_content_filter_unref(f); }
+        }
+        *self.filter.borrow_mut() = Some(new_filter);
+        *self.active_filter_id.borrow_mut() = new_id.to_string();
+        self.apply_to_all();
+    }
 }
 
 impl Drop for AdBlock {
@@ -146,14 +210,17 @@ impl Drop for AdBlock {
     }
 }
 
-/// Callback chamada pelo gio quando `store_save` termina (sucesso ou erro).
+struct CallbackCtx {
+    this: Rc<AdBlock>,
+    filter_id: &'static str,
+}
+
 unsafe extern "C" fn save_finished_trampoline(
     source: *mut glib::gobject_ffi::GObject,
     result: *mut gio::ffi::GAsyncResult,
     user_data: glib::ffi::gpointer,
 ) {
-    // Recupera o Rc<AdBlock> (assume ownership de volta).
-    let this: Box<Rc<AdBlock>> = Box::from_raw(user_data as *mut Rc<AdBlock>);
+    let ctx: Box<CallbackCtx> = Box::from_raw(user_data as *mut CallbackCtx);
     let store = source as *mut ffi::WebKitUserContentFilterStore;
 
     let mut error: *mut glib::ffi::GError = ptr::null_mut();
@@ -166,7 +233,7 @@ unsafe extern "C" fn save_finished_trampoline(
         } else {
             std::ffi::CStr::from_ptr(msg_ptr).to_string_lossy().into_owned()
         };
-        eprintln!("[adblock] failed to compile filter list: {}", msg);
+        eprintln!("[adblock] failed to compile filter list ({}): {}", ctx.filter_id, msg);
         glib::ffi::g_error_free(error);
         return;
     }
@@ -175,12 +242,10 @@ unsafe extern "C" fn save_finished_trampoline(
         return;
     }
 
-    *this.filter.borrow_mut() = Some(filter);
     eprintln!(
-        "[adblock] filter compiled OK; applying to {} tab(s)",
-        this.managers.borrow().len()
+        "[adblock] filter '{}' compiled OK; applying to {} tab(s)",
+        ctx.filter_id,
+        ctx.this.managers.borrow().len()
     );
-    this.apply_to_all();
-    // Box é dropado aqui: libera o Rc clone que detinha a callback.
-    drop(this);
+    ctx.this.install_new_filter(filter, ctx.filter_id);
 }

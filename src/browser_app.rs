@@ -54,15 +54,38 @@ impl BrowserApp {
         let new_tab_button = Button::from_icon_name(Some("list-add-symbolic"), gtk::IconSize::Button);
         header_bar.pack_end(&new_tab_button);
 
-        // Toggle do AdBlock no header.
+        // Toggle do AdBlock no header — estilo clean / minimalista.
         let adblock_toggle = ToggleButton::new();
-        let adblock_icon = Image::from_icon_name(
-            Some("security-high-symbolic"),
-            gtk::IconSize::Button,
-        );
-        adblock_toggle.set_image(Some(&adblock_icon));
-        adblock_toggle.set_tooltip_text(Some("AdBlock (nativo WebKit)"));
+        let adblock_dot = gtk::Label::new(Some("●"));
+        adblock_dot.style_context().add_class("adblock-dot");
+        let adblock_label = gtk::Label::new(Some("AdBlock"));
+        let adblock_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        adblock_box.pack_start(&adblock_dot, false, false, 0);
+        adblock_box.pack_start(&adblock_label, false, false, 0);
+        adblock_toggle.add(&adblock_box);
+        adblock_toggle.set_relief(gtk::ReliefStyle::None);
+        adblock_toggle.set_tooltip_text(Some("AdBlock: clique para alternar"));
         header_bar.pack_end(&adblock_toggle);
+
+        // CSS clean: só um pontinho colorido + texto secundário muda. Sem fundo berrante.
+        let css = gtk::CssProvider::new();
+        let _ = css.load_from_data(b"
+            button.adblock-toggle { padding: 2px 10px; border-radius: 14px; border: 1px solid alpha(@theme_fg_color, 0.18); }
+            button.adblock-toggle:hover { background: alpha(@theme_fg_color, 0.06); }
+            button.adblock-toggle:checked { background: alpha(@theme_fg_color, 0.10); border-color: alpha(@theme_fg_color, 0.30); }
+            button.adblock-toggle label.adblock-dot { font-size: 10px; color: #adb5bd; padding-right: 2px; }
+            button.adblock-toggle.on label.adblock-dot { color: #4c9aff; }
+            button.adblock-toggle.off label.adblock-dot { color: #adb5bd; }
+            button.adblock-toggle label:not(.adblock-dot) { font-size: 11px; font-weight: 500; opacity: 0.85; }
+        ");
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        adblock_toggle.style_context().add_class("adblock-toggle");
 
         window.set_titlebar(Some(&header_bar));
 
@@ -82,6 +105,17 @@ impl BrowserApp {
         // === AdBlock nativo (WebKitUserContentFilterStore) ===
         let adblock = AdBlock::new(&data_dir);
         adblock_toggle.set_active(adblock.enabled());
+        // Aplica estado visual inicial.
+        {
+            let ctx = adblock_toggle.style_context();
+            if adblock.enabled() {
+                ctx.add_class("on"); ctx.remove_class("off");
+                adblock_label.set_text("AdBlock");
+            } else {
+                ctx.add_class("off"); ctx.remove_class("on");
+                adblock_label.set_text("AdBlock off");
+            }
+        }
 
         // Autocomplete da barra de endereço
         let completion = EntryCompletion::new();
@@ -103,10 +137,20 @@ impl BrowserApp {
             adblock,
         };
 
-        // Wire do toggle do AdBlock.
+        // Wire do toggle do AdBlock (feedback visual clean).
         let adblock_for_toggle = app_instance.adblock.clone();
+        let label_t = adblock_label.clone();
         adblock_toggle.connect_toggled(move |btn| {
-            adblock_for_toggle.set_enabled(btn.is_active());
+            let on = btn.is_active();
+            adblock_for_toggle.set_enabled(on);
+            let ctx = btn.style_context();
+            if on {
+                ctx.add_class("on"); ctx.remove_class("off");
+                label_t.set_text("AdBlock");
+            } else {
+                ctx.add_class("off"); ctx.remove_class("on");
+                label_t.set_text("AdBlock off");
+            }
         });
 
         // === Navegação ===
@@ -261,6 +305,8 @@ impl BrowserApp {
         // === UserContentManager dedicado (para AdBlock) ===
         let ucm = UserContentManager::new();
         adblock.register_manager(ucm.clone());
+        // Userscripts específicos (ex.: skip de anúncios no YouTube).
+        crate::userscripts::register_youtube_adblock(&ucm);
 
         // === WebView vinculado a este contexto + UCM ===
         let webview = WebView::builder()

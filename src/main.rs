@@ -4,6 +4,8 @@ use gtk::Application;
 mod browser_app;
 mod history;
 mod adblock;
+mod easylist;
+mod userscripts;
 use browser_app::BrowserApp;
 
 fn main() {
