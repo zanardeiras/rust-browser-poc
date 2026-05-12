@@ -358,6 +358,13 @@ impl BrowserApp {
                 bookmarks_bar_kb.toggle_visible_persisted();
                 return glib::Propagation::Stop;
             }
+            // Ctrl+J — força a barra de favoritos visível (não esconde).
+            if ctrl && (key == gtk::gdk::keys::constants::j
+                || key == gtk::gdk::keys::constants::J)
+            {
+                bookmarks_bar_kb.set_visible_persisted(true);
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
 
