@@ -1,0 +1,11 @@
+[package]
+name = "rust-browser-poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = "0.15"
+wry = "0.24"
+tao = "0.15"
+once_cell = "1.17"
+glib = "0.15"
