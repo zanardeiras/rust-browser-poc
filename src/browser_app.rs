@@ -483,6 +483,8 @@ impl BrowserApp {
         let ucm = UserContentManager::new();
         adblock.register_manager(ucm.clone());
         crate::userscripts::register_youtube_adblock(&ucm);
+        // Impede que as abas durmam no background e travem a HUD do player
+        crate::userscripts::register_background_awake(&ucm);
 
         // Create the WebView with SHARED context
         let webview = WebView::builder()

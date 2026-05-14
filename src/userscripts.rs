@@ -159,3 +159,47 @@ pub fn register_youtube_adblock(ucm: &UserContentManager) {
     );
     ucm.add_style_sheet(&css);
 }
+/// Impede o WebKit de congelar a UI (throttling do requestAnimationFrame) 
+/// quando a aba não está visível. Injetamos um micro-contexto de áudio pra "enganar" 
+/// o navegador a sempre tratar a aba do YouTube como em atividade alta.
+pub fn register_background_awake(ucm: &UserContentManager) {
+    let script_str = r#"
+    (function() {
+        // Redefine document.hidden e document.visibilityState
+        Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+        Object.defineProperty(document, 'hidden', { get: () => false });
+        
+        // Impede os eventos que notificariam o player que a tela foi pra trás
+        window.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
+        window.addEventListener('webkitvisibilitychange', e => e.stopImmediatePropagation(), true);
+        
+        // Dispara um micro canal de áudio inaudível apenas para forçar  
+        // a engine do WebKitGTK a manter o Main Thread vivo com timers normais (60fps)
+        const initAwake = () => {
+            if (window.__awake_audio_ctx) return;
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            window.__awake_audio_ctx = new AudioCtx();
+            const osc = window.__awake_audio_ctx.createOscillator();
+            const gain = window.__awake_audio_ctx.createGain();
+            gain.gain.value = 0.0001; // Quase mudo
+            osc.connect(gain);
+            gain.connect(window.__awake_audio_ctx.destination);
+            osc.start();
+        };
+
+        // Inicia no primeiro mousedown ou touch (evita Autoplay blocks do Webkit)
+        document.addEventListener('mousedown', initAwake, { once: true });
+        document.addEventListener('keydown', initAwake, { once: true });
+    })();
+    "#;
+
+    let script = UserScript::new(
+        script_str,
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[], // Todas as paginas
+        &[],
+    );
+    ucm.add_script(&script);
+}
