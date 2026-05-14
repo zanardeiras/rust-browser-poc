@@ -17,6 +17,7 @@ use crate::adblock::AdBlock;
 use crate::bookmarks::BookmarksStore;
 use crate::bookmarks_bar::BookmarksBar;
 use crate::settings::Settings;
+use crate::password_manager::PasswordStore;
 
 /// Cada aba possui (container_widget, webview).
 type TabEntry = (gtk::Widget, WebView);
@@ -30,6 +31,8 @@ pub struct BrowserApp {
     pub history: HistoryManager,
     pub adblock: Rc<AdBlock>,
     pub bookmarks: Rc<BookmarksStore>,
+    #[allow(dead_code)]
+    pub passwords: Rc<RefCell<PasswordStore>>,
 }
 
 impl BrowserApp {
@@ -67,6 +70,11 @@ impl BrowserApp {
         // New Tab Button
         let new_tab_button = Button::from_icon_name(Some("list-add-symbolic"), gtk::IconSize::Button);
         header_bar.pack_end(&new_tab_button);
+
+        // Password Manager Button
+        let pw_button = Button::from_icon_name(Some("dialog-password-symbolic"), gtk::IconSize::Button);
+        pw_button.set_tooltip_text(Some("Gerenciador de Senhas (Ctrl+P)"));
+        header_bar.pack_end(&pw_button);
 
         // Star Button (favoritar página atual) — fica ao lado de new_tab,
         // FORA da URL bar. Dourado quando favoritado.
@@ -226,6 +234,9 @@ impl BrowserApp {
 
         url_entry.set_completion(Some(&completion));
 
+        // Inicializa PasswordStore apontando para o mesmo data_dir do browser.
+        let passwords = PasswordStore::new(&data_dir);
+
         let app_instance = Self {
             window,
             notebook,
@@ -235,6 +246,7 @@ impl BrowserApp {
             history,
             adblock,
             bookmarks: bookmarks.clone(),
+            passwords: passwords.clone(),
         };
 
         // === Estrelinha externa: click toggla bookmark da página ativa ===
@@ -403,6 +415,17 @@ impl BrowserApp {
             glib::Propagation::Proceed
         });
 
+        // === Botão de gerenciador de senhas ===
+        {
+            let pw_store = passwords.clone();
+            let nb_pw = app_instance.notebook.clone();
+            let wv_pw = app_instance.webviews.clone();
+            let win_pw = app_instance.window.clone();
+            pw_button.connect_clicked(move |_| {
+                open_password_manager(&pw_store, &nb_pw, &wv_pw, &win_pw);
+            });
+        }
+
         // === Atalho Ctrl+H: abre página interna de histórico em nova aba. ===
         let nb_hist = app_instance.notebook.clone();
         let wv_hist = app_instance.webviews.clone();
@@ -412,7 +435,10 @@ impl BrowserApp {
         let h_hist = app_instance.history.clone();
         let update_star_hist = update_star.clone();
         let bookmarks_bar_kb = bookmarks_bar.clone();
-        app_instance.window.connect_key_press_event(move |_, ev| {
+        let pw_store_kb = passwords.clone();
+        let nb_pw_kb = app_instance.notebook.clone();
+        let wv_pw_kb = app_instance.webviews.clone();
+        app_instance.window.connect_key_press_event(move |win, ev| {
             let key = ev.keyval();
             let mods = ev.state();
             let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
@@ -444,6 +470,13 @@ impl BrowserApp {
                 || key == gtk::gdk::keys::constants::J)
             {
                 bookmarks_bar_kb.set_visible_persisted(true);
+                return glib::Propagation::Stop;
+            }
+            // Ctrl+P — abre gerenciador de senhas.
+            if ctrl && (key == gtk::gdk::keys::constants::p
+                || key == gtk::gdk::keys::constants::P)
+            {
+                open_password_manager(&pw_store_kb, &nb_pw_kb, &wv_pw_kb, win);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -621,6 +654,62 @@ fn current_webview(notebook: &Notebook, webviews: &Rc<RefCell<Vec<TabEntry>>>) -
     let idx = notebook.current_page()?;
     let page = notebook.nth_page(Some(idx))?;
     webviews.borrow().iter().find(|(w, _)| w == &page).map(|(_, wv)| wv.clone())
+}
+
+/// Abre o gerenciador de senhas, passando um callback que injeta as credenciais
+/// na WebView ativa via JavaScript.
+fn open_password_manager(
+    pw_store: &Rc<RefCell<PasswordStore>>,
+    notebook: &Notebook,
+    webviews: &Rc<RefCell<Vec<TabEntry>>>,
+    window: &ApplicationWindow,
+) {
+    let current_url = current_webview(notebook, webviews)
+        .and_then(|wv| wv.uri().map(|u| u.to_string()));
+
+    // Callback de preenchimento: injeta username + password via JS na WebView ativa.
+    let wv_fill = current_webview(notebook, webviews);
+    let fill_callback: Option<Rc<dyn Fn(String, String)>> = wv_fill.map(|wv| {
+        let wv = wv.clone();
+        let cb: Rc<dyn Fn(String, String)> = Rc::new(move |user: String, pass: String| {
+            // Escapa para uso dentro de strings JS (aspas simples → \').
+            let user_esc = user.replace('\\', "\\\\").replace('\'', "\\'");
+            let pass_esc = pass.replace('\\', "\\\\").replace('\'', "\\'");
+            let js = format!(
+                r#"(function(u, p) {{
+                    var pwdFields = document.querySelectorAll('input[type="password"]');
+                    var userFields = document.querySelectorAll(
+                        'input[type="text"], input[type="email"], ' +
+                        'input[name*="user"], input[name*="email"], ' +
+                        'input[id*="user"], input[id*="email"], ' +
+                        'input[autocomplete="username"], input[autocomplete="email"]'
+                    );
+                    if (pwdFields.length > 0) {{
+                        pwdFields[0].value = p;
+                        pwdFields[0].dispatchEvent(new Event('input', {{bubbles:true}}));
+                        pwdFields[0].dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                    if (userFields.length > 0) {{
+                        userFields[0].value = u;
+                        userFields[0].dispatchEvent(new Event('input', {{bubbles:true}}));
+                        userFields[0].dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                }})('{}', '{}')"#,
+                user_esc, pass_esc
+            );
+            #[allow(deprecated)]
+            wv.run_javascript(&js, None::<&gio::Cancellable>, |_| {});
+        });
+        cb
+    });
+
+    let win_upcast: gtk::Window = window.clone().upcast();
+    crate::password_manager::open_manager(
+        pw_store.clone(),
+        current_url,
+        fill_callback,
+        Some(&win_upcast),
+    );
 }
 
 fn normalize_url(input: &str) -> String {

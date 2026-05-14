@@ -13,6 +13,7 @@ mod bookmarks;
 mod bookmarks_bar;
 mod bookmarks_manager;
 mod settings;
+mod password_manager;
 use browser_app::BrowserApp;
 
 fn main() {
