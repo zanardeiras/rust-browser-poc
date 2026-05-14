@@ -10,7 +10,7 @@ use webkit2gtk::{
     WebView, WebContext, WebContextExt, WebViewExt, SettingsExt,
     HardwareAccelerationPolicy, CacheModel, WebsiteDataManager, UserContentManager,
     CookieManagerExt, CookiePersistentStorage, CookieAcceptPolicy,
-    WebsiteDataManagerExt, LoadEvent,
+    WebsiteDataManagerExt, LoadEvent, NetworkError,
 };
 use crate::history::HistoryManager;
 use crate::adblock::AdBlock;
@@ -354,6 +354,10 @@ impl BrowserApp {
 
             if let Some(wv) = current_webview(&notebook_nav, &webviews_nav) {
                 wv.load_uri(&url);
+                // Move o foco para o WebView imediatamente: assim o url_entry
+                // perde o foco antes dos eventos assíncronos de uri-notify
+                // dispararem, permitindo que a barra seja atualizada corretamente.
+                wv.grab_focus();
             }
         });
 
@@ -537,10 +541,42 @@ impl BrowserApp {
         webview.connect_uri_notify(move |wv| {
             if let Some(u) = wv.uri() {
                 let s = u.as_str();
-                url_entry_load.set_text(s);
+                // Não atualiza a barra de URL enquanto ela tem foco.
+                // Evita o ciclo síncrono: activate → load_uri → uri-notify
+                // → set_text (com EntryCompletion ativo) → activate novamente,
+                // o que cancela a primeira navegação com "operation was cancelled".
+                if !url_entry_load.has_focus() {
+                    url_entry_load.set_text(s);
+                }
                 // Reseta visual da estrela conforme nova URL.
                 update_star_load(s);
             }
+        });
+
+        // Retry automático para cargas canceladas por race condition.
+        // Máximo de 2 tentativas por navegação para evitar loop infinito.
+        let retry_count: Rc<std::cell::Cell<u8>> = Rc::new(std::cell::Cell::new(0));
+        let retry_fail = retry_count.clone();
+        let retry_ok = retry_count.clone();
+        webview.connect_load_failed(move |wv, _event, uri, error| {
+            if error.matches(NetworkError::Cancelled) {
+                let n = retry_fail.get();
+                if n < 2 {
+                    retry_fail.set(n + 1);
+                    let uri_owned = uri.to_string();
+                    let wv_clone = wv.clone();
+                    glib::timeout_add_local(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            wv_clone.load_uri(&uri_owned);
+                            glib::ControlFlow::Break
+                        },
+                    );
+                    return true; // suprime a página de erro do WebKit
+                }
+            }
+            retry_fail.set(0);
+            false
         });
 
         // Signal: registra histórico ao terminar de carregar (cliques em links,
@@ -548,6 +584,7 @@ impl BrowserApp {
         let history_load = history.clone();
         webview.connect_load_changed(move |wv, event| {
             if event == LoadEvent::Finished {
+                retry_ok.set(0); // reseta contador de retries a cada carga bem-sucedida
                 if let Some(u) = wv.uri() {
                     let s = u.as_str();
                     // Ignora URLs internas/efêmeras.
