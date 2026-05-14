@@ -25,6 +25,16 @@ fn main() {
     std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "0");
     std::env::set_var("WEBKIT_USE_GLIB_EVENT_LOOP", "0");
 
+    // === GStreamer (Video/Audio Hardware Acceleration) ===
+    // O WebKit2GTK usa o GStreamer por debaixo dos panos.
+    // Forçamos plugar decodificação via GPU (VA-API e NVDEC para NVIDIA).
+    std::env::set_var(
+        "GST_PLUGIN_FEATURE_RANK",
+        "nvdec:MAX,nvenc:MAX,vaapidecodebin:MAX,vaapih264dec:MAX,vaapivp9dec:MAX,vaapih265dec:MAX"
+    );
+    // Permite que o GStreamer utilize buffers DMA diretamente da placa de vídeo
+    std::env::set_var("GST_VAAPI_ALL_DRIVERS", "1");
+
     // Aumenta a prioridade do processo
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, -10);
