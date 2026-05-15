@@ -264,6 +264,33 @@ pub fn register_background_awake(ucm: &UserContentManager) {
         // A cada 500ms, se detectarmos que rAF voltou após throttle, ou
         // simplesmente periodicamente em páginas YT, disparamos eventos
         // sintéticos que forçam o YT a recompor controles/HUD.
+        //
+        // Caso especial: vídeo PAUSADO. O GStreamer não emite frames quando
+        // o `<video>` está pausado; ao retornar foco, a textura no composite
+        // layer fica stale (frame "congelado" preto/borrado). A solução é
+        // um seek-to-self (`currentTime = currentTime`) que força o pipeline
+        // a re-decodar e o WebKit a re-renderizar o frame.
+        const repaintVideos = () => {
+            try {
+                document.querySelectorAll('video').forEach(v => {
+                    // Só atua em vídeos com mídia carregada (readyState >= 2 = HAVE_CURRENT_DATA).
+                    if (!v || v.readyState < 2) return;
+                    const t = v.currentTime;
+                    if (!isFinite(t)) return;
+                    if (v.paused) {
+                        // Seek-to-self: re-emite o frame atual sem audível "click".
+                        try { v.currentTime = t; } catch (_) {}
+                    }
+                    // Toggle de transform força recomposição da camada GPU.
+                    const prev = v.style.transform;
+                    v.style.transform = (prev || '') + ' translateZ(0)';
+                    requestAnimationFrame(() => { v.style.transform = prev; });
+                });
+            } catch (_) {}
+        };
+        // Exposto para o lado Rust acionar via run_javascript no focus-in.
+        window.__rbpoc_repaint_videos = repaintVideos;
+
         let wasThrottled = false;
         setInterval(() => {
             const now = performance.now();
@@ -290,6 +317,7 @@ pub fn register_background_awake(ucm: &UserContentManager) {
                             clientX: x, clientY: y,
                         }));
                     }
+                    if (justResumed) repaintVideos();
                 } catch (_) {}
             }
         }, 500);

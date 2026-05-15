@@ -487,11 +487,19 @@ impl BrowserApp {
         // da HUD do player YT ficar "stale" porque o WebKit suspende o paint
         // pipeline quando a window perde foco — sem isso, o vídeo continua
         // (GStreamer), mas a HUD/controles ficam congelados até um mousemove.
+        // Também aciona o repaint dos <video> pausados (seek-to-self) via
+        // helper JS injetado pelo userscript `register_background_awake`.
         let wv_focus = app_instance.webviews.clone();
         let nb_focus = app_instance.notebook.clone();
         app_instance.window.connect_focus_in_event(move |_, _| {
             if let Some(wv) = current_webview(&nb_focus, &wv_focus) {
                 wv.queue_draw();
+                #[allow(deprecated)]
+                wv.run_javascript(
+                    "if (window.__rbpoc_repaint_videos) window.__rbpoc_repaint_videos();",
+                    None::<&gio::Cancellable>,
+                    |_| {},
+                );
             }
             glib::Propagation::Proceed
         });
