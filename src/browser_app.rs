@@ -482,6 +482,20 @@ impl BrowserApp {
             glib::Propagation::Proceed
         });
 
+        // Quando a janela GTK volta a receber foco (usuário trocou de janela
+        // e voltou), força um redraw da webview atual. Isso resolve o caso
+        // da HUD do player YT ficar "stale" porque o WebKit suspende o paint
+        // pipeline quando a window perde foco — sem isso, o vídeo continua
+        // (GStreamer), mas a HUD/controles ficam congelados até um mousemove.
+        let wv_focus = app_instance.webviews.clone();
+        let nb_focus = app_instance.notebook.clone();
+        app_instance.window.connect_focus_in_event(move |_, _| {
+            if let Some(wv) = current_webview(&nb_focus, &wv_focus) {
+                wv.queue_draw();
+            }
+            glib::Propagation::Proceed
+        });
+
         app_instance
     }
 

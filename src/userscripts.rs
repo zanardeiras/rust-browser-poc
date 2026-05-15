@@ -159,38 +159,140 @@ pub fn register_youtube_adblock(ucm: &UserContentManager) {
     );
     ucm.add_style_sheet(&css);
 }
-/// Impede o WebKit de congelar a UI (throttling do requestAnimationFrame) 
-/// quando a aba não está visível. Injetamos um micro-contexto de áudio pra "enganar" 
-/// o navegador a sempre tratar a aba do YouTube como em atividade alta.
+/// Impede o WebKit de congelar a UI (throttling do requestAnimationFrame)
+/// quando a aba não está visível OU quando a janela perde foco.
+///
+/// Sintoma sem este fix: o vídeo (GStreamer) continua rodando em background,
+/// mas a HUD do player YouTube (barra de progresso, controles, tempo) "trava"
+/// porque o WebKitGTK suspende o rAF quando a `GtkWindow` perde foco — e o
+/// player do YT depende de rAF + eventos `blur/focus` da window para se
+/// redesenhar.
+///
+/// Estratégia (cumulativa, sem efeitos colaterais visíveis):
+///   1. `visibilityState/hidden` forçados a visible/false.
+///   2. Eventos `visibilitychange`, `blur`, `focus`, `pagehide`, `freeze`
+///      bloqueados via capture + stopImmediatePropagation.
+///   3. `document.hasFocus()` sempre `true`.
+///   4. Polyfill rAF: detecta throttling (callback levou > 100ms) e injeta
+///      um fallback baseado em `setTimeout(16ms)` em paralelo, para manter
+///      animações da HUD rodando mesmo quando o WebKit suspende rAF nativo.
+///   5. AudioContext silencioso (legado, mantém main thread vivo).
+///   6. Watchdog: enquanto rAF estiver atrasado, dispara `mousemove` sintético
+///      no `.html5-video-player` + `resize` na window — isso força o YT
+///      a recompor a HUD assim que a janela volta ao foco.
 pub fn register_background_awake(ucm: &UserContentManager) {
     let script_str = r#"
     (function() {
-        // Redefine document.hidden e document.visibilityState
-        Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
-        Object.defineProperty(document, 'hidden', { get: () => false });
-        
-        // Impede os eventos que notificariam o player que a tela foi pra trás
-        window.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
-        window.addEventListener('webkitvisibilitychange', e => e.stopImmediatePropagation(), true);
-        
-        // Dispara um micro canal de áudio inaudível apenas para forçar  
-        // a engine do WebKitGTK a manter o Main Thread vivo com timers normais (60fps)
+        if (window.__rbpoc_awake__) return;
+        window.__rbpoc_awake__ = true;
+
+        // --- 1. visibility forçada -----------------------------------------
+        try {
+            Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+            Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+        } catch (_) {}
+
+        // --- 2. bloqueio de eventos que sinalizam "fui pra trás" -----------
+        const swallow = e => { e.stopImmediatePropagation(); };
+        const blocked = ['visibilitychange', 'webkitvisibilitychange',
+                         'blur', 'focusout', 'pagehide', 'freeze'];
+        for (const ev of blocked) {
+            window.addEventListener(ev, swallow, true);
+            document.addEventListener(ev, swallow, true);
+        }
+
+        // --- 3. hasFocus sempre true ---------------------------------------
+        try { document.hasFocus = () => true; } catch (_) {}
+
+        // --- 4. rAF com fallback anti-throttling ---------------------------
+        const nativeRAF = window.requestAnimationFrame.bind(window);
+        const nativeCAF = window.cancelAnimationFrame.bind(window);
+        let lastTick = performance.now();
+        let throttled = false;
+        const pending = new Map(); // id -> { cb, nativeId, timerId }
+        let nextId = 1;
+
+        window.requestAnimationFrame = function(cb) {
+            const id = nextId++;
+            const entry = { cb, nativeId: 0, timerId: 0, fired: false };
+            const wrap = (ts) => {
+                if (entry.fired) return;
+                entry.fired = true;
+                if (entry.timerId) clearTimeout(entry.timerId);
+                pending.delete(id);
+                const now = performance.now();
+                throttled = (now - lastTick) > 100;
+                lastTick = now;
+                try { cb(ts); } catch (e) { /* swallow */ }
+            };
+            entry.nativeId = nativeRAF(wrap);
+            // Fallback paralelo: se rAF não disparar em 32ms, força via timer.
+            entry.timerId = setTimeout(() => wrap(performance.now()), 32);
+            pending.set(id, entry);
+            return id;
+        };
+        window.cancelAnimationFrame = function(id) {
+            const entry = pending.get(id);
+            if (!entry) { try { nativeCAF(id); } catch (_) {} return; }
+            entry.fired = true;
+            if (entry.nativeId) { try { nativeCAF(entry.nativeId); } catch (_) {} }
+            if (entry.timerId) clearTimeout(entry.timerId);
+            pending.delete(id);
+        };
+
+        // --- 5. AudioContext inaudível (mantém main thread vivo) -----------
         const initAwake = () => {
             if (window.__awake_audio_ctx) return;
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
             if (!AudioCtx) return;
-            window.__awake_audio_ctx = new AudioCtx();
-            const osc = window.__awake_audio_ctx.createOscillator();
-            const gain = window.__awake_audio_ctx.createGain();
-            gain.gain.value = 0.0001; // Quase mudo
-            osc.connect(gain);
-            gain.connect(window.__awake_audio_ctx.destination);
-            osc.start();
+            try {
+                window.__awake_audio_ctx = new AudioCtx();
+                const osc = window.__awake_audio_ctx.createOscillator();
+                const gain = window.__awake_audio_ctx.createGain();
+                gain.gain.value = 0.0001;
+                osc.connect(gain);
+                gain.connect(window.__awake_audio_ctx.destination);
+                osc.start();
+            } catch (_) {}
         };
+        document.addEventListener('mousedown', initAwake, { once: true, capture: true });
+        document.addEventListener('keydown',   initAwake, { once: true, capture: true });
+        document.addEventListener('touchstart',initAwake, { once: true, capture: true });
 
-        // Inicia no primeiro mousedown ou touch (evita Autoplay blocks do Webkit)
-        document.addEventListener('mousedown', initAwake, { once: true });
-        document.addEventListener('keydown', initAwake, { once: true });
+        // --- 6. Watchdog: cutuca a HUD do YT quando voltamos do background -
+        // A cada 500ms, se detectarmos que rAF voltou após throttle, ou
+        // simplesmente periodicamente em páginas YT, disparamos eventos
+        // sintéticos que forçam o YT a recompor controles/HUD.
+        let wasThrottled = false;
+        setInterval(() => {
+            const now = performance.now();
+            const gap = now - lastTick;
+            // Se rAF parou (gap > 250ms), considera throttled.
+            const currentlyThrottled = gap > 250;
+            const justResumed = wasThrottled && !currentlyThrottled;
+            wasThrottled = currentlyThrottled;
+
+            // Sempre que detectarmos retorno de throttle OU a cada 2s em YT,
+            // forçamos o player a redesenhar a HUD.
+            const isYT = /youtube\.com|youtube-nocookie\.com/.test(location.hostname);
+            if (justResumed || (isYT && Math.random() < 0.05)) {
+                try {
+                    window.dispatchEvent(new Event('resize'));
+                    const player = document.querySelector('.html5-video-player');
+                    if (player) {
+                        const rect = player.getBoundingClientRect();
+                        const x = rect.left + rect.width / 2;
+                        const y = rect.top + rect.height / 2;
+                        // mousemove cutuca o auto-hide do YT a recompor a HUD
+                        player.dispatchEvent(new MouseEvent('mousemove', {
+                            bubbles: true, cancelable: true,
+                            clientX: x, clientY: y,
+                        }));
+                    }
+                } catch (_) {}
+            }
+        }, 500);
     })();
     "#;
 
