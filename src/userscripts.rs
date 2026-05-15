@@ -159,27 +159,23 @@ pub fn register_youtube_adblock(ucm: &UserContentManager) {
     );
     ucm.add_style_sheet(&css);
 }
-/// Impede o WebKit de congelar a UI (throttling do requestAnimationFrame)
-/// quando a aba não está visível OU quando a janela perde foco.
+/// Impede o WebKit de congelar a UI quando a aba/janela perde foco.
 ///
-/// Sintoma sem este fix: o vídeo (GStreamer) continua rodando em background,
-/// mas a HUD do player YouTube (barra de progresso, controles, tempo) "trava"
-/// porque o WebKitGTK suspende o rAF quando a `GtkWindow` perde foco — e o
-/// player do YT depende de rAF + eventos `blur/focus` da window para se
-/// redesenhar.
-///
-/// Estratégia (cumulativa, sem efeitos colaterais visíveis):
+/// Estratégia:
 ///   1. `visibilityState/hidden` forçados a visible/false.
-///   2. Eventos `visibilitychange`, `blur`, `focus`, `pagehide`, `freeze`
-///      bloqueados via capture + stopImmediatePropagation.
+///   2. Apenas `visibilitychange` bloqueado — NÃO bloqueamos `blur/focus/focusout`
+///      porque eles são usados pelo player para saber que tem foco e aceitar
+///      teclado/mouse. Bloquear blur na fase capture impede que o evento chegue
+///      aos elementos-alvo (seek bar, botões), quebrando controle por mouse/setas.
 ///   3. `document.hasFocus()` sempre `true`.
-///   4. Polyfill rAF: detecta throttling (callback levou > 100ms) e injeta
-///      um fallback baseado em `setTimeout(16ms)` em paralelo, para manter
-///      animações da HUD rodando mesmo quando o WebKit suspende rAF nativo.
-///   5. AudioContext silencioso (legado, mantém main thread vivo).
-///   6. Watchdog: enquanto rAF estiver atrasado, dispara `mousemove` sintético
-///      no `.html5-video-player` + `resize` na window — isso força o YT
-///      a recompor a HUD assim que a janela volta ao foco.
+///   4. AudioContext inaudível — mantém o main thread ativo (evita throttling
+///      de timers/rAF pelo WebKitGTK em páginas sem atividade de áudio).
+///      NÃO sobrescrevemos `requestAnimationFrame` — o polyfill de rAF altera o
+///      timestamp passado aos callbacks e quebra cálculos de coordenadas do player.
+///   5. Watchdog via setInterval: ao retornar de background, dispara `resize` +
+///      `mousemove` sintético no player para forçar recomposição da HUD.
+///   6. `repaintVideos`: para vídeos pausados, um seek-to-self força o GStreamer
+///      a re-emitir o frame e o WebKit a re-renderizar a textura GPU.
 pub fn register_background_awake(ucm: &UserContentManager) {
     let script_str = r#"
     (function() {
@@ -189,66 +185,32 @@ pub fn register_background_awake(ucm: &UserContentManager) {
         // --- 1. visibility forçada -----------------------------------------
         try {
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-            Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-            Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+            Object.defineProperty(document, 'hidden',          { get: () => false,     configurable: true });
+            Object.defineProperty(document, 'webkitHidden',    { get: () => false,     configurable: true });
         } catch (_) {}
 
-        // --- 2. bloqueio de eventos que sinalizam "fui pra trás" -----------
-        const swallow = e => { e.stopImmediatePropagation(); };
-        const blocked = ['visibilitychange', 'webkitvisibilitychange',
-                         'blur', 'focusout', 'pagehide', 'freeze'];
-        for (const ev of blocked) {
-            window.addEventListener(ev, swallow, true);
-            document.addEventListener(ev, swallow, true);
-        }
+        // --- 2. bloqueia APENAS visibilitychange ---------------------------
+        // NÃO bloqueamos blur/focusout: eles precisam chegar ao player para
+        // que controles de mouse e setas do teclado funcionem corretamente.
+        const swallow = e => e.stopImmediatePropagation();
+        window.addEventListener('visibilitychange',       swallow, true);
+        window.addEventListener('webkitvisibilitychange', swallow, true);
+        window.addEventListener('pagehide',               swallow, true);
+        window.addEventListener('freeze',                 swallow, true);
+        document.addEventListener('visibilitychange',     swallow, true);
+        document.addEventListener('webkitvisibilitychange', swallow, true);
 
-        // --- 3. hasFocus sempre true ---------------------------------------
+        // --- 3. hasFocus sempre true ----------------------------------------
         try { document.hasFocus = () => true; } catch (_) {}
 
-        // --- 4. rAF com fallback anti-throttling ---------------------------
-        const nativeRAF = window.requestAnimationFrame.bind(window);
-        const nativeCAF = window.cancelAnimationFrame.bind(window);
-        let lastTick = performance.now();
-        let throttled = false;
-        const pending = new Map(); // id -> { cb, nativeId, timerId }
-        let nextId = 1;
-
-        window.requestAnimationFrame = function(cb) {
-            const id = nextId++;
-            const entry = { cb, nativeId: 0, timerId: 0, fired: false };
-            const wrap = (ts) => {
-                if (entry.fired) return;
-                entry.fired = true;
-                if (entry.timerId) clearTimeout(entry.timerId);
-                pending.delete(id);
-                const now = performance.now();
-                throttled = (now - lastTick) > 100;
-                lastTick = now;
-                try { cb(ts); } catch (e) { /* swallow */ }
-            };
-            entry.nativeId = nativeRAF(wrap);
-            // Fallback paralelo: se rAF não disparar em 32ms, força via timer.
-            entry.timerId = setTimeout(() => wrap(performance.now()), 32);
-            pending.set(id, entry);
-            return id;
-        };
-        window.cancelAnimationFrame = function(id) {
-            const entry = pending.get(id);
-            if (!entry) { try { nativeCAF(id); } catch (_) {} return; }
-            entry.fired = true;
-            if (entry.nativeId) { try { nativeCAF(entry.nativeId); } catch (_) {} }
-            if (entry.timerId) clearTimeout(entry.timerId);
-            pending.delete(id);
-        };
-
-        // --- 5. AudioContext inaudível (mantém main thread vivo) -----------
+        // --- 4. AudioContext inaudível (evita throttle de timers/rAF) ------
         const initAwake = () => {
             if (window.__awake_audio_ctx) return;
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
             if (!AudioCtx) return;
             try {
                 window.__awake_audio_ctx = new AudioCtx();
-                const osc = window.__awake_audio_ctx.createOscillator();
+                const osc  = window.__awake_audio_ctx.createOscillator();
                 const gain = window.__awake_audio_ctx.createGain();
                 gain.gain.value = 0.0001;
                 osc.connect(gain);
@@ -256,65 +218,55 @@ pub fn register_background_awake(ucm: &UserContentManager) {
                 osc.start();
             } catch (_) {}
         };
-        document.addEventListener('mousedown', initAwake, { once: true, capture: true });
-        document.addEventListener('keydown',   initAwake, { once: true, capture: true });
-        document.addEventListener('touchstart',initAwake, { once: true, capture: true });
+        document.addEventListener('mousedown',  initAwake, { once: true, capture: true });
+        document.addEventListener('keydown',    initAwake, { once: true, capture: true });
+        document.addEventListener('touchstart', initAwake, { once: true, capture: true });
 
-        // --- 6. Watchdog: cutuca a HUD do YT quando voltamos do background -
-        // A cada 500ms, se detectarmos que rAF voltou após throttle, ou
-        // simplesmente periodicamente em páginas YT, disparamos eventos
-        // sintéticos que forçam o YT a recompor controles/HUD.
-        //
-        // Caso especial: vídeo PAUSADO. O GStreamer não emite frames quando
-        // o `<video>` está pausado; ao retornar foco, a textura no composite
-        // layer fica stale (frame "congelado" preto/borrado). A solução é
-        // um seek-to-self (`currentTime = currentTime`) que força o pipeline
-        // a re-decodar e o WebKit a re-renderizar o frame.
+        // --- 5 & 6. Watchdog + repaint de vídeos pausados ------------------
+        // `repaintVideos`: seek-to-self em vídeos pausados para forçar o
+        // GStreamer a re-emitir o frame (textura GPU fica stale sem isso).
         const repaintVideos = () => {
             try {
                 document.querySelectorAll('video').forEach(v => {
-                    // Só atua em vídeos com mídia carregada (readyState >= 2 = HAVE_CURRENT_DATA).
                     if (!v || v.readyState < 2) return;
                     const t = v.currentTime;
                     if (!isFinite(t)) return;
-                    if (v.paused) {
-                        // Seek-to-self: re-emite o frame atual sem audível "click".
-                        try { v.currentTime = t; } catch (_) {}
-                    }
-                    // Toggle de transform força recomposição da camada GPU.
-                    const prev = v.style.transform;
-                    v.style.transform = (prev || '') + ' translateZ(0)';
+                    // Seek-to-self: re-emite frame sem clique audível.
+                    if (v.paused) { try { v.currentTime = t; } catch (_) {} }
+                    // Toggle translateZ invalida camada GPU → força recomposição.
+                    const prev = v.style.transform || '';
+                    v.style.transform = prev + ' translateZ(0)';
                     requestAnimationFrame(() => { v.style.transform = prev; });
                 });
             } catch (_) {}
         };
-        // Exposto para o lado Rust acionar via run_javascript no focus-in.
+        // Exposto para o Rust acionar via run_javascript no focus-in do GTK.
         window.__rbpoc_repaint_videos = repaintVideos;
 
+        // Tick de referência: atualizado a cada rAF nativo para detectar
+        // quando o WebKit throttla (gap > 250ms = background).
+        let lastTick = performance.now();
         let wasThrottled = false;
+        const tick = (ts) => { lastTick = ts; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
+
         setInterval(() => {
-            const now = performance.now();
-            const gap = now - lastTick;
-            // Se rAF parou (gap > 250ms), considera throttled.
+            const gap = performance.now() - lastTick;
             const currentlyThrottled = gap > 250;
             const justResumed = wasThrottled && !currentlyThrottled;
             wasThrottled = currentlyThrottled;
 
-            // Sempre que detectarmos retorno de throttle OU a cada 2s em YT,
-            // forçamos o player a redesenhar a HUD.
             const isYT = /youtube\.com|youtube-nocookie\.com/.test(location.hostname);
             if (justResumed || (isYT && Math.random() < 0.05)) {
                 try {
                     window.dispatchEvent(new Event('resize'));
                     const player = document.querySelector('.html5-video-player');
                     if (player) {
-                        const rect = player.getBoundingClientRect();
-                        const x = rect.left + rect.width / 2;
-                        const y = rect.top + rect.height / 2;
-                        // mousemove cutuca o auto-hide do YT a recompor a HUD
+                        const r = player.getBoundingClientRect();
                         player.dispatchEvent(new MouseEvent('mousemove', {
                             bubbles: true, cancelable: true,
-                            clientX: x, clientY: y,
+                            clientX: r.left + r.width / 2,
+                            clientY: r.top  + r.height / 2,
                         }));
                     }
                     if (justResumed) repaintVideos();
@@ -328,7 +280,7 @@ pub fn register_background_awake(ucm: &UserContentManager) {
         script_str,
         UserContentInjectedFrames::TopFrame,
         UserScriptInjectionTime::Start,
-        &[], // Todas as paginas
+        &[], // Todas as páginas
         &[],
     );
     ucm.add_script(&script);
