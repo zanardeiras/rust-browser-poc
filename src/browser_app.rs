@@ -44,9 +44,26 @@ impl BrowserApp {
             .default_height(768)
             .build();
 
-        // Carregar ícone nativo
+        // Carregar ícone nativo. Importante: escalar pra um tamanho sensato
+        // (máx 256px no maior lado) ANTES de set_icon, senão no backend
+        // Wayland o GDK tenta criar uma cairo image surface no tamanho
+        // original do PNG. Se o PNG for grande (ex.: 1610x2400), o
+        // compositor Wayland rejeita com "invalid value (typically too big)
+        // for the size of the input" — crashando o app no startup.
         if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file("icon.png") {
-            window.set_icon(Some(&pixbuf));
+            let (w, h) = (pixbuf.width(), pixbuf.height());
+            let max_side = w.max(h);
+            let icon = if max_side > 256 {
+                let scale = 256.0 / max_side as f64;
+                let nw = (w as f64 * scale).round() as i32;
+                let nh = (h as f64 * scale).round() as i32;
+                pixbuf
+                    .scale_simple(nw.max(1), nh.max(1), gtk::gdk_pixbuf::InterpType::Bilinear)
+                    .unwrap_or(pixbuf)
+            } else {
+                pixbuf
+            };
+            window.set_icon(Some(&icon));
         }
 
         let header_bar = HeaderBar::new();
