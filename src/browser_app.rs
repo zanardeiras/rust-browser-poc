@@ -211,8 +211,28 @@ impl BrowserApp {
         }
 
         // Histórico: insere versão "limpa" de cada URL.
+        // IMPORTANTE: URLs longas (>120 chars) são truncadas antes de
+        // entrarem no autocomplete. Sem isso, entries com 15K+ chars
+        // (ex.: URLs com `continue=` aninhado do Google) fazem o Pango
+        // calcular uma largura > 16384px no popup do EntryCompletion,
+        // estourando o limite de surface do Wayland e crashando o app
+        // com "Gdk-CRITICAL: invalid value (typically too big)".
+        const MAX_DISPLAY_LEN: usize = 120;
         for item in history.load() {
-            insert_unique(&strip_url_for_display(&item));
+            let display = strip_url_for_display(&item);
+            if display.is_empty() { continue; }
+            if display.chars().count() <= MAX_DISPLAY_LEN {
+                insert_unique(&display);
+            } else {
+                // Mantém só host + início do path/query, sem ser tão longo
+                // que estoure o popup. Truncamos por chars (não bytes) para
+                // não cortar no meio de UTF-8.
+                let truncated: String = display
+                    .chars()
+                    .take(MAX_DISPLAY_LEN)
+                    .collect();
+                insert_unique(&truncated);
+            }
         }
 
         completion.set_model(Some(&store));
@@ -376,7 +396,14 @@ impl BrowserApp {
 
             // Atualiza store do autocomplete usando a versão "display"
             // (sem https://www.) para casar com o esquema de inline-completion.
-            let display = strip_url_for_display(&url);
+            // Trunca strings longas — ver MAX_DISPLAY_LEN acima: URLs com
+            // mais de 120 chars estouram surface do Wayland no popup.
+            let display_raw = strip_url_for_display(&url);
+            let display: String = if display_raw.chars().count() > 120 {
+                display_raw.chars().take(120).collect()
+            } else {
+                display_raw
+            };
             let mut found = false;
             if let Some(iter) = store_nav.iter_first() {
                 loop {
@@ -429,6 +456,33 @@ impl BrowserApp {
         // Auto-select text on focus (click)
         app_instance.url_entry.connect_button_release_event(|entry, _| {
             entry.select_region(0, -1);
+            glib::Propagation::Proceed
+        });
+
+        // === Fix do "duplo Enter" causado pelo EntryCompletion ===
+        //
+        // Problema: com `popup_completion=true`, quando o popup do autocomplete
+        // está visível (sempre, com `minimum_key_length=1`), o handler default
+        // do GtkEntryCompletion intercepta a tecla Return/Enter para FECHAR o
+        // popup, sem disparar o signal `activate` do Entry. Resultado:
+        //   1º Enter → popup fecha, navegação NÃO acontece.
+        //   2º Enter → activate dispara, navegação ocorre.
+        //
+        // Corrigimos interceptando Return/KP_Enter na fase `key_press_event`
+        // (que roda ANTES do handler do completion), disparando o activate
+        // explicitamente e retornando `Stop` para que o default handler do
+        // EntryCompletion não veja o Enter — sem isso, ele ainda fecharia o
+        // popup e nossa lógica de navegação rodaria 2x. Com Stop, a navegação
+        // acontece no 1º Enter e o popup some sozinho via uri/focus change.
+        app_instance.url_entry.connect_key_press_event(|entry, ev| {
+            let key = ev.keyval();
+            if key == gtk::gdk::keys::constants::Return
+                || key == gtk::gdk::keys::constants::KP_Enter
+                || key == gtk::gdk::keys::constants::ISO_Enter
+            {
+                entry.emit_activate();
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
 
@@ -658,15 +712,63 @@ impl BrowserApp {
             }
         });
 
-        // Suprime a tela de erro nativa branca ("operation was cancelled")
-        // caso o carregamento tenha sido cancelado (ex: o adblock em
-        // background terminou de recompilar e atualizou o content manager,
-        // cancelando implicitamente a rede do WebKit no momento exato,
-        // ou você apertou outro link no meio do caminho).
-        webview.connect_load_failed(move |_wv, _event, _uri, error| {
+        // Auto-retry quando o WebKit cancela uma navegação. Cenário comum:
+        // logo no startup, o AdBlock ainda está compilando assíncronamente.
+        // Quando a compilação termina, o filtro é instalado retroativamente
+        // em todas as UCMs — o WebKit cancela a request HTTP em andamento,
+        // resultando em página em branco. Antes o usuário tinha que apertar
+        // Enter de novo; agora reagendamos automaticamente.
+        //
+        // O contador `retry_count` evita loop infinito (cap em 2 retries
+        // por URI). Resetamos no `load_changed` quando uma nova URI começa
+        // a carregar, para permitir 1-2 retries por navegação distinta.
+        let retry_state: Rc<RefCell<(String, u8)>> = Rc::new(RefCell::new((String::new(), 0)));
+        let retry_state_changed = retry_state.clone();
+        webview.connect_load_changed(move |wv, event| {
+            if event == LoadEvent::Started {
+                if let Some(u) = wv.uri() {
+                    let s = u.to_string();
+                    let mut st = retry_state_changed.borrow_mut();
+                    if st.0 != s {
+                        st.0 = s;
+                        st.1 = 0;
+                    }
+                }
+            }
+        });
+
+        let retry_state_fail = retry_state.clone();
+        webview.connect_load_failed(move |wv, _event, uri, error| {
             if error.matches(NetworkError::Cancelled) {
+                // Só re-tenta para URLs http(s) reais. about:blank, data:, etc. são ignorados.
+                let is_http = uri.starts_with("http://") || uri.starts_with("https://");
+                if is_http {
+                    let should_retry = {
+                        let mut st = retry_state_fail.borrow_mut();
+                        if st.0 != uri {
+                            st.0 = uri.to_string();
+                            st.1 = 0;
+                        }
+                        if st.1 < 2 {
+                            st.1 += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_retry {
+                        // Reload assíncrono no próximo tick do main loop —
+                        // dentro do handler de load_failed o webview ainda
+                        // está em estado interno "failing"; chamar load_uri
+                        // direto pode disparar o cancel/load num ciclo apertado.
+                        let wv_retry = wv.clone();
+                        let uri_owned = uri.to_string();
+                        glib::idle_add_local_once(move || {
+                            wv_retry.load_uri(&uri_owned);
+                        });
+                    }
+                }
                 // Return `true` ignora o display da página de erro default branca.
-                // Isso deixa a URL anterior desenhada no browser e ele logo sai do estado branco.
                 return true;
             }
             false
