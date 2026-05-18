@@ -585,7 +585,11 @@ impl BrowserApp {
                 // Usamos `pixbuf_get_from_surface` que aceita qualquer Surface.
                 let w = surface_size(&surface).0;
                 let h = surface_size(&surface).1;
-                if w == 0 || h == 0 { return; }
+                // Rejeita dimensões inválidas: zero, negativas ou grandes demais.
+                // Cairo lança CAIRO_STATUS_INVALID_SIZE acima de ~32767, mas
+                // favicons corrompidos podem retornar valores ainda maiores,
+                // causando o crash "invalid value (too big) for the size of the input".
+                if w <= 0 || h <= 0 || w > 512 || h > 512 { return; }
                 if let Some(pb) = gtk::gdk::pixbuf_get_from_surface(&surface, 0, 0, w, h) {
                     // Escala pra 16x16 (tamanho padrão de favicon em aba).
                     if let Some(scaled) = pb.scale_simple(
@@ -765,8 +769,13 @@ fn strip_url_for_display(url: &str) -> String {
 fn surface_size(surface: &gtk::cairo::Surface) -> (i32, i32) {
     // Tenta cast para ImageSurface (caminho rápido — todo favicon WebKit é raster).
     if let Ok(img) = surface.clone().try_into() as Result<gtk::cairo::ImageSurface, _> {
-        return (img.width(), img.height());
+        let (w, h) = (img.width(), img.height());
+        // Retorna (0,0) para sinalizar surface inválida; o caller descarta via bounds check.
+        if w > 0 && h > 0 && w <= 512 && h <= 512 {
+            return (w, h);
+        }
+        return (0, 0);
     }
-    // Fallback: usa o device_scale + extents do contexto (defensivo).
+    // Fallback defensivo.
     (16, 16)
 }
